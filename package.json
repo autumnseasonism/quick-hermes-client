@@ -9,8 +9,22 @@
     "pack": "electron-builder --mac --dir",
     "dist": "electron-builder --mac"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "hermes-agent",
+    "electron",
+    "macos",
+    "floating-window",
+    "ai-agent"
+  ],
+  "author": "OpenAI Codex",
+  "homepage": "https://github.com/comeonzhj/quick-hermes-client#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/comeonzhj/quick-hermes-client.git"
+  },
+  "bugs": {
+    "url": "https://github.com/comeonzhj/quick-hermes-client/issues"
+  },
   "license": "MIT",
   "type": "commonjs",
   "build": {
