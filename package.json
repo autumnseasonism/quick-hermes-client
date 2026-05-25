@@ -38,7 +38,6 @@
     "mac": {
       "category": "public.app-category.productivity",
       "icon": "assets/icon.icns",
-      "identity": null,
       "target": [
         "dmg",
         "zip"
