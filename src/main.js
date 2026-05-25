@@ -50,7 +50,6 @@ function loadState() {
     settings: { ...DEFAULT_SETTINGS, ...(loaded.settings || {}) },
     sessions: Array.isArray(loaded.sessions) ? loaded.sessions : [],
   };
-  app.setLoginItemSettings({ openAtLogin: Boolean(state.settings.launchAtLogin) });
 }
 
 function saveState() {
