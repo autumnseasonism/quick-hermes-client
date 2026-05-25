@@ -62,8 +62,11 @@ function publicState() {
 }
 
 function getHeaders() {
-  const headers = { "Content-Type": "application/json", "X-Hermes-Session-Key": "quick-hermes-client" };
-  if (state.settings.apiKey) headers.Authorization = `Bearer ${state.settings.apiKey}`;
+  const headers = { "Content-Type": "application/json" };
+  if (state.settings.apiKey) {
+    headers.Authorization = `Bearer ${state.settings.apiKey}`;
+    headers["X-Hermes-Session-Key"] = "quick-hermes-client";
+  }
   return headers;
 }
 

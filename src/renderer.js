@@ -12,7 +12,6 @@ const appEl = document.getElementById("app");
 const bubble = document.getElementById("bubble");
 const panel = document.getElementById("panel");
 const busyDot = document.getElementById("busyDot");
-const collapseBtn = document.getElementById("collapseBtn");
 const settingsBtn = document.getElementById("settingsBtn");
 const settingsView = document.getElementById("settingsView");
 const chatView = document.getElementById("chatView");
@@ -170,7 +169,6 @@ async function handleDrop(event, target) {
 
 bubble.addEventListener("mouseenter", () => setExpanded(true));
 bubble.addEventListener("click", () => setExpanded(true));
-collapseBtn.addEventListener("click", () => setExpanded(false));
 settingsBtn.addEventListener("click", () => {
   settingsView.classList.remove("hidden");
   chatView.classList.add("hidden");
