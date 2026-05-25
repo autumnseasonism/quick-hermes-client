@@ -35,12 +35,23 @@ function currentSession() {
   return state.sessions.find((session) => session.id === activeSessionId) || state.sessions[0] || null;
 }
 
-function setExpanded(next) {
+function applyExpanded(next) {
   expanded = next;
   appEl.classList.toggle("expanded", expanded);
   appEl.classList.toggle("collapsed", !expanded);
   api.setWindowMode(expanded ? "expanded" : "collapsed");
   if (expanded) setTimeout(() => input.focus(), 80);
+}
+
+async function setExpanded(next) {
+  if (next) {
+    const result = await api.ensureFreshSession();
+    state = result.state;
+    activeSessionId = result.sessionId;
+    selectedExplicitly = false;
+  }
+  applyExpanded(next);
+  render();
 }
 
 function formatTime(iso) {
@@ -78,7 +89,7 @@ function renderMessages() {
 }
 
 function renderSessions() {
-  const sessions = showAllSessions ? state.sessions : state.sessions.slice(0, 5);
+  const sessions = showAllSessions ? state.sessions : state.sessions.slice(0, 3);
   sessionList.innerHTML = "";
   for (const session of sessions) {
     const button = document.createElement("button");
@@ -100,7 +111,7 @@ function renderChips() {
   const session = currentSession();
   contextChips.innerHTML = "";
   const chips = [];
-  if (session?.workspacePath) chips.push(`工作空间：${session.workspacePath}`);
+  if (session?.pendingWorkspacePath) chips.push(`工作空间：${session.pendingWorkspacePath}`);
   for (const filePath of session?.pendingAttachments || []) chips.push(`附件：${filePath}`);
   for (const imagePath of pendingClipboardImages) chips.push(`图片：${imagePath}`);
   for (const text of chips) {
@@ -262,8 +273,11 @@ api.onRunEvent(({ sessionId, event }) => {
 });
 api.onOpenSession(({ sessionId }) => {
   activeSessionId = sessionId;
-  setExpanded(true);
+  applyExpanded(true);
   render();
+});
+api.onWindowCollapsed(() => {
+  applyExpanded(false);
 });
 
 api.getState().then((nextState) => {

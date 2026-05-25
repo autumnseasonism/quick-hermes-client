@@ -84,6 +84,7 @@ function newSession(seed = {}) {
     updatedAt: createdAt,
     completedAt: null,
     workspacePath: seed.workspacePath || "",
+    pendingWorkspacePath: seed.workspacePath || "",
     pendingAttachments: seed.pendingAttachments || [],
     messages: [],
   };
@@ -100,6 +101,11 @@ function latestUsableSession() {
   return elapsedMs > idleMs ? newSession() : latest;
 }
 
+function ensureFreshSession() {
+  const session = latestUsableSession();
+  return { state: publicState(), sessionId: session.id };
+}
+
 function summarizeTitle(text) {
   const clean = String(text || "").replace(/\s+/g, " ").trim();
   return clean ? clean.slice(0, 28) : "新会话";
@@ -107,7 +113,7 @@ function summarizeTitle(text) {
 
 function buildUserContent(session, text, extra = {}) {
   const blocks = [];
-  const workspacePath = extra.workspacePath || session.workspacePath;
+  const workspacePath = extra.workspacePath || session.pendingWorkspacePath || "";
   const attachments = [...(session.pendingAttachments || []), ...(extra.attachments || [])];
   const images = [...(extra.images || [])];
   if (workspacePath) blocks.push(`当前会话的作业工作空间路径：\`${workspacePath}\``);
@@ -146,6 +152,7 @@ function createWindow() {
     skipTaskbar: true,
     hasShadow: false,
     title: "Quick Hermes",
+    icon: path.join(__dirname, "..", "assets", "icon.png"),
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -156,6 +163,10 @@ function createWindow() {
   mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   mainWindow.loadFile(path.join(__dirname, "renderer.html"));
   mainWindow.once("ready-to-show", () => mainWindow.show());
+  mainWindow.on("blur", () => {
+    updateWindowMode("collapsed");
+    sendEvent("window-collapsed", {});
+  });
 }
 
 function sendEvent(channel, payload) {
@@ -253,6 +264,7 @@ async function sendMessage(_event, payload) {
   if (session.messages.length === 0) session.title = summarizeTitle(text);
   session.messages.push({ id: makeId("msg"), role: "user", content: fullText, createdAt: nowIso() });
   session.pendingAttachments = [];
+  session.pendingWorkspacePath = "";
   session.completedAt = null;
   session.updatedAt = nowIso();
   saveState();
@@ -320,6 +332,7 @@ app.whenReady().then(() => {
   createWindow();
 
   ipcMain.handle("app:get-state", () => publicState());
+  ipcMain.handle("session:ensure-fresh", () => ensureFreshSession());
   ipcMain.handle("window:set-mode", (_event, mode) => updateWindowMode(mode));
   ipcMain.handle("session:new", (_event, seed) => {
     const session = newSession(seed || {});
@@ -337,7 +350,10 @@ app.whenReady().then(() => {
       session = newSession({ workspacePath: folders[0], title: path.basename(folders[0]) || "工作空间会话" });
     } else {
       session = session || latestUsableSession();
-      if (folders.length && !session.workspacePath) session.workspacePath = folders[0];
+      if (folders.length) {
+        if (!session.workspacePath) session.workspacePath = folders[0];
+        session.pendingWorkspacePath = folders[0];
+      }
       session.pendingAttachments = [...(session.pendingAttachments || []), ...files];
       session.updatedAt = nowIso();
       saveState();

@@ -18,10 +18,12 @@
     "productName": "Quick Hermes",
     "files": [
       "src/**/*",
+      "assets/**/*",
       "package.json"
     ],
     "mac": {
       "category": "public.app-category.productivity",
+      "icon": "assets/icon.icns",
       "identity": null,
       "target": [
         "dmg",
