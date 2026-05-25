@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Quick Hermes</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main id="app" class="app collapsed">
+      <button id="bubble" class="bubble" aria-label="打开 Quick Hermes">
+        <span class="mark">H</span>
+        <span id="busyDot" class="busy-dot hidden"></span>
+      </button>
+
+      <section id="panel" class="panel" aria-label="Quick Hermes 对话">
+        <header class="topbar">
+          <button id="collapseBtn" class="icon-button" title="收起">⌄</button>
+          <div class="title-area">
+            <div class="app-title">Quick Hermes</div>
+            <div id="statusLine" class="status-line">准备就绪</div>
+          </div>
+          <button id="settingsBtn" class="icon-button" title="设置">⚙</button>
+        </header>
+
+        <div id="settingsView" class="settings-view hidden">
+          <label>
+            <span>Hermes API</span>
+            <input id="apiBaseUrl" type="text" spellcheck="false" />
+          </label>
+          <label>
+            <span>API Key</span>
+            <input id="apiKey" type="password" spellcheck="false" placeholder="本机无密钥可留空" />
+          </label>
+          <label>
+            <span>新会话间隔（分钟）</span>
+            <input id="idleMinutes" type="number" min="1" max="1440" />
+          </label>
+          <label class="toggle-row">
+            <span>开机自动启动</span>
+            <input id="launchAtLogin" type="checkbox" />
+          </label>
+          <div class="settings-actions">
+            <button id="saveSettingsBtn" class="primary-action">保存</button>
+            <button id="closeSettingsBtn" class="secondary-action">返回</button>
+          </div>
+        </div>
+
+        <div id="chatView" class="chat-view">
+          <div id="messages" class="messages"></div>
+
+          <section class="composer">
+            <div id="contextChips" class="context-chips"></div>
+            <textarea id="input" rows="3" placeholder="输入消息，按 ⌘ Enter 发送"></textarea>
+            <div class="composer-row">
+              <button id="newSessionBtn" class="secondary-action">新会话</button>
+              <button id="sendBtn" class="primary-action">发送</button>
+            </div>
+          </section>
+
+          <section class="history">
+            <div class="history-head">
+              <span>最近会话</span>
+              <button id="toggleAllBtn" class="link-button">展开全部</button>
+            </div>
+            <div id="sessionList" class="session-list"></div>
+          </section>
+        </div>
+      </section>
+    </main>
+    <script src="./renderer.js"></script>
+  </body>
+</html>
