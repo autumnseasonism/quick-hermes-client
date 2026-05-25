@@ -230,6 +230,7 @@ async function readSse(runId, sessionId) {
         saveState();
         activeRuns.delete(sessionId);
         sendEvent("state-changed", publicState());
+        sendEvent("run-event", { sessionId, event });
       }
     }
   }
@@ -285,6 +286,7 @@ async function sendMessage(_event, payload) {
     activeRuns.delete(session.id);
     saveState();
     sendEvent("state-changed", publicState());
+    sendEvent("run-event", { sessionId: session.id, event: { event: "run.failed", error: error.message } });
   });
   return { state: publicState(), sessionId: session.id };
 }

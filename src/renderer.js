@@ -7,6 +7,7 @@ let showAllSessions = false;
 let sending = false;
 let pendingClipboardImages = [];
 let selectedExplicitly = false;
+const runningSessionIds = new Set();
 
 const appEl = document.getElementById("app");
 const bubble = document.getElementById("bubble");
@@ -48,7 +49,7 @@ function formatTime(iso) {
 }
 
 function isRunning(session) {
-  return Boolean(session?.messages?.some((msg) => msg.pending));
+  return Boolean(session && (runningSessionIds.has(session.id) || session.messages?.some((msg) => msg.pending)));
 }
 
 function renderMessages() {
@@ -66,6 +67,12 @@ function renderMessages() {
       item.textContent = msg.pending ? `${msg.content}\n▌` : msg.content;
       messagesEl.appendChild(item);
     }
+  }
+  if (isRunning(session)) {
+    const indicator = document.createElement("div");
+    indicator.className = "work-indicator";
+    indicator.innerHTML = '<span class="pulse-dot"></span><span class="pulse-dot"></span><span class="pulse-dot"></span><span>Hermes 正在处理</span>';
+    messagesEl.appendChild(indicator);
   }
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
@@ -114,7 +121,8 @@ function renderSettings() {
 
 function renderStatus() {
   const session = currentSession();
-  const running = state.sessions.some(isRunning) || sending;
+  const running = state.sessions.some(isRunning) || runningSessionIds.size > 0 || sending;
+  appEl.classList.toggle("is-running", running);
   busyDot.classList.toggle("hidden", !running);
   sendBtn.disabled = running && isRunning(session);
   statusLine.textContent = running ? "Hermes 正在处理任务" : (session ? session.title : "准备就绪");
@@ -133,7 +141,10 @@ async function sendCurrentMessage() {
   const text = input.value.trim();
   if (!text || sending) return;
   sending = true;
+  const provisionalSessionId = activeSessionId;
+  if (provisionalSessionId) runningSessionIds.add(provisionalSessionId);
   sendBtn.disabled = true;
+  render();
   try {
     const result = await api.sendMessage({
       sessionId: activeSessionId,
@@ -142,12 +153,17 @@ async function sendCurrentMessage() {
       forceContinue: selectedExplicitly,
     });
     state = result.state;
+    if (provisionalSessionId && provisionalSessionId !== result.sessionId) {
+      runningSessionIds.delete(provisionalSessionId);
+    }
     activeSessionId = result.sessionId;
+    runningSessionIds.add(activeSessionId);
     selectedExplicitly = false;
     pendingClipboardImages = [];
     input.value = "";
     render();
   } catch (error) {
+    if (provisionalSessionId) runningSessionIds.delete(provisionalSessionId);
     statusLine.textContent = error.message || "发送失败";
   } finally {
     sending = false;
@@ -230,10 +246,19 @@ api.onStateChanged((nextState) => {
   state = nextState;
   render();
 });
-api.onRunEvent(({ event }) => {
+api.onRunEvent(({ sessionId, event }) => {
   if (event.event === "tool.started") statusLine.textContent = `正在使用工具：${event.tool || "工具"}`;
   if (event.event === "tool.completed") statusLine.textContent = `工具完成：${event.tool || "工具"}`;
-  if (event.event === "run.completed") statusLine.textContent = "任务已完成";
+  if (event.event === "run.completed") {
+    runningSessionIds.delete(sessionId);
+    statusLine.textContent = "任务已完成";
+    render();
+  }
+  if (event.event === "run.failed") {
+    runningSessionIds.delete(sessionId);
+    statusLine.textContent = "任务失败";
+    render();
+  }
 });
 api.onOpenSession(({ sessionId }) => {
   activeSessionId = sessionId;
