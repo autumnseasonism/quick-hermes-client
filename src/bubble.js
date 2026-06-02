@@ -2,6 +2,14 @@ const api = window.quickHermes;
 
 const appEl = document.getElementById("app");
 const bubble = document.getElementById("bubble");
+const darkQuery = window.matchMedia("(prefers-color-scheme: dark)");
+let currentTheme = "system";
+
+function applyTheme(theme) {
+  if (theme) currentTheme = theme;
+  const dark = currentTheme === "dark" || (currentTheme === "system" && darkQuery.matches);
+  document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+}
 
 function setRunning(running) {
   appEl.classList.toggle("is-running", Boolean(running));
@@ -11,11 +19,14 @@ function runningFromState(state) {
   return (state?.sessions || []).some((session) => (session.messages || []).some((msg) => msg.pending));
 }
 
-// Busy ring reflects whether any run is in flight. busy-changed is the precise
-// signal from main; state-changed is a fallback for pending streamed messages.
-api.getState().then((state) => setRunning(runningFromState(state)));
+darkQuery.addEventListener("change", () => applyTheme());
+api.onThemeChanged(({ theme }) => applyTheme(theme));
 api.onBusyChanged(({ busy }) => setRunning(busy));
 api.onStateChanged((state) => setRunning(runningFromState(state)));
+api.getState().then((state) => {
+  applyTheme(state && state.settings ? state.settings.theme : "system");
+  setRunning(runningFromState(state));
+});
 
 bubble.addEventListener("click", () => api.expand());
 bubble.addEventListener("mouseenter", () => api.expand());

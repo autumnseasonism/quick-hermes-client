@@ -5,7 +5,7 @@
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
-    "check": "node --check src/main.js && node --check src/preload.js && node --check src/renderer.js && node --check src/bubble.js",
+    "check": "node --check src/main.js && node --check src/preload.js && node --check src/renderer.js && node --check src/bubble.js && node --check src/markdown.js",
     "pack": "electron-builder --dir",
     "dist": "electron-builder",
     "pack:mac": "electron-builder --mac --dir",
