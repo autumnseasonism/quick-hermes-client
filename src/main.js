@@ -1,7 +1,13 @@
-const { app, BrowserWindow, ipcMain, Notification, clipboard, nativeImage } = require("electron");
+const { app, BrowserWindow, Tray, Menu, ipcMain, Notification, clipboard, screen } = require("electron");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+
+const isMac = process.platform === "darwin";
+const BUBBLE_SIZE = 72;
+const PANEL_WIDTH = 430;
+const PANEL_HEIGHT = 640;
+const EDGE_MARGIN = 24;
 
 const DEFAULT_SETTINGS = {
   apiBaseUrl: "http://127.0.0.1:8642",
@@ -10,7 +16,10 @@ const DEFAULT_SETTINGS = {
   launchAtLogin: false,
 };
 
-let mainWindow;
+let bubbleWindow = null;
+let panelWindow = null;
+let tray = null;
+let isQuitting = false;
 let storePath;
 let attachmentDir;
 let state = {
@@ -127,23 +136,15 @@ function buildUserContent(session, text, extra = {}) {
   return blocks.filter(Boolean).join("\n\n");
 }
 
-function updateWindowMode(mode) {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  if (mode === "collapsed") {
-    mainWindow.setSize(72, 72, true);
-  } else {
-    mainWindow.setSize(430, 640, true);
-  }
-}
+// ---------------------------------------------------------------------------
+// Window management — dual-window architecture (bubble + panel).
+// Two fixed-size windows toggled by show/hide instead of resizing a single
+// transparent window, which avoids the flicker/black-edge issues that a
+// transparent BrowserWindow hits on Windows when resized.
+// ---------------------------------------------------------------------------
 
-function createWindow() {
-  mainWindow = new BrowserWindow({
-    width: 72,
-    height: 72,
-    minWidth: 72,
-    minHeight: 72,
-    maxWidth: 560,
-    maxHeight: 760,
+function windowOptions(extra) {
+  return {
     frame: false,
     transparent: true,
     resizable: false,
@@ -159,18 +160,108 @@ function createWindow() {
       nodeIntegration: false,
       sandbox: false,
     },
-  });
-  mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-  mainWindow.loadFile(path.join(__dirname, "renderer.html"));
-  mainWindow.once("ready-to-show", () => mainWindow.show());
-  mainWindow.on("blur", () => {
-    updateWindowMode("collapsed");
-    sendEvent("window-collapsed", {});
+    ...extra,
+  };
+}
+
+function makeVisibleEverywhere(win) {
+  // macOS Spaces-only API; on Windows/Linux it is a no-op, so guard it.
+  if (isMac) win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+}
+
+function createBubbleWindow() {
+  bubbleWindow = new BrowserWindow(
+    windowOptions({ width: BUBBLE_SIZE, height: BUBBLE_SIZE, minWidth: BUBBLE_SIZE, minHeight: BUBBLE_SIZE })
+  );
+  makeVisibleEverywhere(bubbleWindow);
+  bubbleWindow.loadFile(path.join(__dirname, "bubble.html"));
+  const primary = screen.getPrimaryDisplay().workArea;
+  bubbleWindow.setPosition(
+    Math.round(primary.x + primary.width - BUBBLE_SIZE - EDGE_MARGIN),
+    Math.round(primary.y + EDGE_MARGIN)
+  );
+  bubbleWindow.once("ready-to-show", () => bubbleWindow.show());
+  bubbleWindow.on("close", (event) => {
+    if (!isQuitting) event.preventDefault();
   });
 }
 
+function createPanelWindow() {
+  panelWindow = new BrowserWindow(
+    windowOptions({ width: PANEL_WIDTH, height: PANEL_HEIGHT, minWidth: PANEL_WIDTH, minHeight: PANEL_HEIGHT })
+  );
+  makeVisibleEverywhere(panelWindow);
+  panelWindow.loadFile(path.join(__dirname, "renderer.html"));
+  panelWindow.on("blur", () => collapse());
+  panelWindow.on("close", (event) => {
+    if (!isQuitting) {
+      event.preventDefault();
+      collapse();
+    }
+  });
+}
+
+function positionPanelNearBubble() {
+  if (!panelWindow || panelWindow.isDestroyed()) return;
+  if (!bubbleWindow || bubbleWindow.isDestroyed()) return;
+  const b = bubbleWindow.getBounds();
+  const wa = screen.getDisplayNearestPoint({ x: b.x, y: b.y }).workArea;
+  let x = b.x;
+  let y = b.y;
+  // Keep the whole panel inside the work area of the bubble's display.
+  x = Math.max(wa.x, Math.min(x, wa.x + wa.width - PANEL_WIDTH));
+  y = Math.max(wa.y, Math.min(y, wa.y + wa.height - PANEL_HEIGHT));
+  panelWindow.setPosition(Math.round(x), Math.round(y));
+}
+
+function expand() {
+  if (!panelWindow || panelWindow.isDestroyed()) return;
+  positionPanelNearBubble();
+  if (bubbleWindow && !bubbleWindow.isDestroyed()) bubbleWindow.hide();
+  panelWindow.show();
+  panelWindow.focus();
+  const session = latestUsableSession();
+  sendEvent("panel-shown", { sessionId: session.id, state: publicState() });
+}
+
+function collapse() {
+  if (panelWindow && !panelWindow.isDestroyed() && panelWindow.isVisible()) panelWindow.hide();
+  if (bubbleWindow && !bubbleWindow.isDestroyed()) bubbleWindow.show();
+}
+
+function toggle() {
+  if (panelWindow && !panelWindow.isDestroyed() && panelWindow.isVisible()) collapse();
+  else expand();
+}
+
+function createTray() {
+  tray = new Tray(path.join(__dirname, "..", "assets", "icon.png"));
+  tray.setToolTip("Quick Hermes");
+  const menu = Menu.buildFromTemplate([
+    { label: "显示面板", click: () => expand() },
+    { label: "隐藏到悬浮球", click: () => collapse() },
+    { type: "separator" },
+    {
+      label: "退出 Quick Hermes",
+      click: () => {
+        isQuitting = true;
+        app.quit();
+      },
+    },
+  ]);
+  tray.setContextMenu(menu);
+  tray.on("click", () => toggle());
+  tray.on("double-click", () => expand());
+}
+
 function sendEvent(channel, payload) {
-  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload);
+  for (const win of [bubbleWindow, panelWindow]) {
+    if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
+  }
+}
+
+function broadcastBusy() {
+  sendEvent("busy-changed", { busy: activeRuns.size > 0 });
 }
 
 function notifyCompleted(session) {
@@ -181,7 +272,7 @@ function notifyCompleted(session) {
     silent: false,
   });
   notification.on("click", () => {
-    updateWindowMode("expanded");
+    expand();
     sendEvent("open-session", { sessionId: session.id });
   });
   notification.show();
@@ -231,6 +322,7 @@ async function readSse(runId, sessionId) {
         session.updatedAt = session.completedAt;
         saveState();
         activeRuns.delete(sessionId);
+        broadcastBusy();
         sendEvent("state-changed", publicState());
         sendEvent("run-event", { sessionId, event });
         notifyCompleted(session);
@@ -240,6 +332,7 @@ async function readSse(runId, sessionId) {
         session.updatedAt = session.completedAt;
         saveState();
         activeRuns.delete(sessionId);
+        broadcastBusy();
         sendEvent("state-changed", publicState());
         sendEvent("run-event", { sessionId, event });
       }
@@ -289,6 +382,7 @@ async function sendMessage(_event, payload) {
   }
   const run = await response.json();
   activeRuns.set(session.id, run.run_id);
+  broadcastBusy();
   readSse(run.run_id, session.id).catch((error) => {
     const failed = getSession(session.id);
     if (!failed) return;
@@ -296,6 +390,7 @@ async function sendMessage(_event, payload) {
     failed.completedAt = nowIso();
     failed.updatedAt = failed.completedAt;
     activeRuns.delete(session.id);
+    broadcastBusy();
     saveState();
     sendEvent("state-changed", publicState());
     sendEvent("run-event", { sessionId: session.id, event: { event: "run.failed", error: error.message } });
@@ -328,12 +423,16 @@ function saveClipboardImage() {
 }
 
 app.whenReady().then(() => {
+  if (process.platform === "win32") app.setAppUserModelId("com.quickhermes.client");
   loadState();
-  createWindow();
+  createBubbleWindow();
+  createPanelWindow();
+  createTray();
 
   ipcMain.handle("app:get-state", () => publicState());
   ipcMain.handle("session:ensure-fresh", () => ensureFreshSession());
-  ipcMain.handle("window:set-mode", (_event, mode) => updateWindowMode(mode));
+  ipcMain.handle("window:expand", () => expand());
+  ipcMain.handle("window:collapse", () => collapse());
   ipcMain.handle("session:new", (_event, seed) => {
     const session = newSession(seed || {});
     return { state: publicState(), sessionId: session.id };
@@ -370,15 +469,27 @@ app.whenReady().then(() => {
       idleMinutes: Math.max(1, Number(nextSettings.idleMinutes || 30)),
       launchAtLogin: Boolean(nextSettings.launchAtLogin),
     };
-    app.setLoginItemSettings({ openAtLogin: state.settings.launchAtLogin });
+    app.setLoginItemSettings({ openAtLogin: state.settings.launchAtLogin, path: process.execPath });
     saveState();
     return publicState();
   });
   ipcMain.handle("settings:login-item", () => app.getLoginItemSettings());
+
+  app.on("activate", () => {
+    if (!bubbleWindow || bubbleWindow.isDestroyed()) {
+      createBubbleWindow();
+      createPanelWindow();
+    } else {
+      collapse();
+    }
+  });
 });
 
-app.on("window-all-closed", (event) => event.preventDefault());
+app.on("before-quit", () => {
+  isQuitting = true;
+});
 
-app.on("activate", () => {
-  if (BrowserWindow.getAllWindows().length === 0) createWindow();
+// Keep the app resident in the tray when all windows are hidden/closed.
+app.on("window-all-closed", (event) => {
+  if (!isQuitting) event.preventDefault();
 });

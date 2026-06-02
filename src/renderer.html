@@ -7,12 +7,7 @@
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
-    <main id="app" class="app collapsed">
-      <button id="bubble" class="bubble" aria-label="打开 Quick Hermes">
-        <span class="mark">H</span>
-        <span id="busyDot" class="busy-dot hidden"></span>
-      </button>
-
+    <main id="app" class="app expanded">
       <section id="panel" class="panel" aria-label="Quick Hermes 对话">
         <header class="topbar">
           <div class="title-area">
@@ -50,7 +45,7 @@
 
           <section class="composer">
             <div id="contextChips" class="context-chips"></div>
-            <textarea id="input" rows="3" placeholder="输入消息，按 ⌘ Enter 发送"></textarea>
+            <textarea id="input" rows="3" placeholder="输入消息发送"></textarea>
             <div class="composer-row">
               <button id="newSessionBtn" class="secondary-action">新会话</button>
               <button id="sendBtn" class="primary-action">发送</button>

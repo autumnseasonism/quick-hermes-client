@@ -5,9 +5,13 @@
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
-    "check": "node --check src/main.js && node --check src/preload.js",
-    "pack": "electron-builder --mac --dir",
-    "dist": "electron-builder --mac"
+    "check": "node --check src/main.js && node --check src/preload.js && node --check src/renderer.js && node --check src/bubble.js",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder",
+    "pack:mac": "electron-builder --mac --dir",
+    "dist:mac": "electron-builder --mac",
+    "pack:win": "electron-builder --win --dir",
+    "dist:win": "electron-builder --win"
   },
   "keywords": [
     "hermes-agent",
@@ -41,6 +45,12 @@
       "target": [
         "dmg",
         "zip"
+      ]
+    },
+    "win": {
+      "icon": "assets/icon.png",
+      "target": [
+        "nsis"
       ]
     }
   },

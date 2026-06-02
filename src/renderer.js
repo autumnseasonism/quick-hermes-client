@@ -2,17 +2,17 @@ const api = window.quickHermes;
 
 let state = { settings: {}, sessions: [] };
 let activeSessionId = null;
-let expanded = false;
 let showAllSessions = false;
 let sending = false;
 let pendingClipboardImages = [];
 let selectedExplicitly = false;
 const runningSessionIds = new Set();
 
+const isMacPlatform = navigator.platform.toUpperCase().includes("MAC");
+const SEND_HINT = isMacPlatform ? "⌘ Enter" : "Ctrl Enter";
+
 const appEl = document.getElementById("app");
-const bubble = document.getElementById("bubble");
 const panel = document.getElementById("panel");
-const busyDot = document.getElementById("busyDot");
 const settingsBtn = document.getElementById("settingsBtn");
 const settingsView = document.getElementById("settingsView");
 const chatView = document.getElementById("chatView");
@@ -31,27 +31,10 @@ const apiKey = document.getElementById("apiKey");
 const idleMinutes = document.getElementById("idleMinutes");
 const launchAtLogin = document.getElementById("launchAtLogin");
 
+input.placeholder = `输入消息，按 ${SEND_HINT} 发送`;
+
 function currentSession() {
   return state.sessions.find((session) => session.id === activeSessionId) || state.sessions[0] || null;
-}
-
-function applyExpanded(next) {
-  expanded = next;
-  appEl.classList.toggle("expanded", expanded);
-  appEl.classList.toggle("collapsed", !expanded);
-  api.setWindowMode(expanded ? "expanded" : "collapsed");
-  if (expanded) setTimeout(() => input.focus(), 80);
-}
-
-async function setExpanded(next) {
-  if (next) {
-    const result = await api.ensureFreshSession();
-    state = result.state;
-    activeSessionId = result.sessionId;
-    selectedExplicitly = false;
-  }
-  applyExpanded(next);
-  render();
 }
 
 function formatTime(iso) {
@@ -133,8 +116,6 @@ function renderSettings() {
 function renderStatus() {
   const session = currentSession();
   const running = state.sessions.some(isRunning) || runningSessionIds.size > 0 || sending;
-  appEl.classList.toggle("is-running", running);
-  busyDot.classList.toggle("hidden", !running);
   sendBtn.disabled = running && isRunning(session);
   statusLine.textContent = running ? "Hermes 正在处理任务" : (session ? session.title : "准备就绪");
 }
@@ -146,6 +127,10 @@ function render() {
   renderChips();
   renderSettings();
   renderStatus();
+}
+
+function focusInput() {
+  setTimeout(() => input.focus(), 60);
 }
 
 async function sendCurrentMessage() {
@@ -182,20 +167,17 @@ async function sendCurrentMessage() {
   }
 }
 
-async function handleDrop(event, target) {
+async function handleDrop(event) {
   event.preventDefault();
   appEl.classList.remove("drop-ready");
   const paths = [...event.dataTransfer.files].map((file) => api.filePath(file)).filter(Boolean);
   if (!paths.length) return;
-  const result = await api.dropPaths({ target, sessionId: activeSessionId, paths });
+  const result = await api.dropPaths({ target: "panel", sessionId: activeSessionId, paths });
   state = result.state;
   activeSessionId = result.sessionId;
-  setExpanded(true);
   render();
 }
 
-bubble.addEventListener("mouseenter", () => setExpanded(true));
-bubble.addEventListener("click", () => setExpanded(true));
 settingsBtn.addEventListener("click", () => {
   settingsView.classList.remove("hidden");
   chatView.classList.add("hidden");
@@ -230,7 +212,7 @@ toggleAllBtn.addEventListener("click", () => {
 });
 
 input.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && event.metaKey) sendCurrentMessage();
+  if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) sendCurrentMessage();
 });
 
 document.addEventListener("paste", async () => {
@@ -246,11 +228,10 @@ document.addEventListener("dragover", (event) => {
   appEl.classList.add("drop-ready");
 });
 document.addEventListener("dragleave", () => appEl.classList.remove("drop-ready"));
-bubble.addEventListener("drop", (event) => handleDrop(event, "icon"));
-panel.addEventListener("drop", (event) => handleDrop(event, "panel"));
+panel.addEventListener("drop", (event) => handleDrop(event));
 
 window.addEventListener("blur", () => {
-  setExpanded(false);
+  api.collapse();
 });
 
 api.onStateChanged((nextState) => {
@@ -273,11 +254,16 @@ api.onRunEvent(({ sessionId, event }) => {
 });
 api.onOpenSession(({ sessionId }) => {
   activeSessionId = sessionId;
-  applyExpanded(true);
+  selectedExplicitly = true;
   render();
+  focusInput();
 });
-api.onWindowCollapsed(() => {
-  applyExpanded(false);
+api.onPanelShown(({ sessionId, state: nextState }) => {
+  if (nextState) state = nextState;
+  if (sessionId) activeSessionId = sessionId;
+  selectedExplicitly = false;
+  render();
+  focusInput();
 });
 
 api.getState().then((nextState) => {
