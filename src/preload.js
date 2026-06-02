@@ -2,7 +2,8 @@ const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
 contextBridge.exposeInMainWorld("quickHermes", {
   getState: () => ipcRenderer.invoke("app:get-state"),
-  setWindowMode: (mode) => ipcRenderer.invoke("window:set-mode", mode),
+  expand: () => ipcRenderer.invoke("window:expand"),
+  collapse: () => ipcRenderer.invoke("window:collapse"),
   ensureFreshSession: () => ipcRenderer.invoke("session:ensure-fresh"),
   newSession: (seed) => ipcRenderer.invoke("session:new", seed),
   sendMessage: (payload) => ipcRenderer.invoke("message:send", payload),
@@ -25,9 +26,14 @@ contextBridge.exposeInMainWorld("quickHermes", {
     ipcRenderer.on("open-session", listener);
     return () => ipcRenderer.removeListener("open-session", listener);
   },
-  onWindowCollapsed: (callback) => {
+  onPanelShown: (callback) => {
     const listener = (_event, payload) => callback(payload);
-    ipcRenderer.on("window-collapsed", listener);
-    return () => ipcRenderer.removeListener("window-collapsed", listener);
+    ipcRenderer.on("panel-shown", listener);
+    return () => ipcRenderer.removeListener("panel-shown", listener);
+  },
+  onBusyChanged: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("busy-changed", listener);
+    return () => ipcRenderer.removeListener("busy-changed", listener);
   },
 });

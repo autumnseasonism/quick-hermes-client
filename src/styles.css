@@ -23,7 +23,7 @@ body {
   margin: 0;
   overflow: hidden;
   background: transparent;
-  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
   color: var(--ink);
   letter-spacing: 0;
 }
