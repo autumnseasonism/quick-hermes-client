@@ -100,10 +100,6 @@ textarea {
   z-index: 1;
 }
 
-.busy-dot {
-  display: none;
-}
-
 .panel {
   display: none;
   width: 100%;

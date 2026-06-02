@@ -147,7 +147,11 @@ function flushState() {
 }
 
 function publicState() {
-  const settings = { ...state.settings, apiKey: state.settings.apiKey ? "********" : "" };
+  // Mask as set when a key is present OR when a stored cipher couldn't be
+  // decrypted — otherwise the UI shows an empty field that would round-trip
+  // back as "clear the key" and overwrite the preserved cipher.
+  const hasKey = Boolean(state.settings.apiKey) || apiKeyDecryptFailed;
+  const settings = { ...state.settings, apiKey: hasKey ? "********" : "" };
   return { settings, sessions: state.sessions };
 }
 

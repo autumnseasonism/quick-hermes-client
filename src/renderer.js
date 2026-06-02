@@ -304,7 +304,13 @@ async function sendCurrentMessage() {
       runningSessionIds.delete(provisionalSessionId);
     }
     activeSessionId = result.sessionId;
-    runningSessionIds.add(activeSessionId);
+    const activeSess = state.sessions.find((session) => session.id === activeSessionId);
+    if (activeSess && !activeSess.completedAt) {
+      runningSessionIds.add(activeSessionId);
+    } else {
+      // Already finalized (e.g. stopped during the initial POST) — don't re-mark running.
+      runningSessionIds.delete(activeSessionId);
+    }
     selectedExplicitly = false;
     pendingClipboardImages = [];
     input.value = "";
