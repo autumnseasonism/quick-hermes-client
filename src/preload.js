@@ -18,6 +18,7 @@ contextBridge.exposeInMainWorld("quickHermes", {
   sendMessage: (payload) => ipcRenderer.invoke("message:send", payload),
   cancelRun: (sessionId) => ipcRenderer.invoke("run:cancel", sessionId),
   testConnection: (payload) => ipcRenderer.invoke("connection:test", payload),
+  copyText: (text) => ipcRenderer.invoke("clipboard:write-text", text),
   dropPaths: (payload) => ipcRenderer.invoke("paths:drop", payload),
   saveClipboardImage: () => ipcRenderer.invoke("clipboard:save-image"),
   saveSettings: (settings) => ipcRenderer.invoke("settings:save", settings),

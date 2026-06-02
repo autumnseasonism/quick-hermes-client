@@ -654,12 +654,34 @@ input:focus {
 .test-result.fail {
   color: var(--warn);
 }
-select#themeSelect {
-  width: 100%;
+.seg {
+  display: flex;
+  gap: 4px;
+}
+.seg-btn {
+  flex: 1;
   border: 1px solid var(--line);
-  border-radius: 8px;
   background: var(--surface);
-  color: var(--ink);
-  padding: 8px;
+  color: var(--muted);
+  border-radius: 8px;
+  padding: 7px 6px;
+  font-size: 12px;
+  cursor: pointer;
   -webkit-app-region: no-drag;
+}
+.seg-btn.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+:root[data-theme="light"] .message.markdown pre {
+  background: #f3f1ea;
+}
+:root[data-theme="light"] .message.markdown pre code {
+  color: #2a2825;
+}
+:root[data-theme="light"] .code-copy {
+  border-color: rgba(0, 0, 0, 0.12);
+  background: rgba(0, 0, 0, 0.05);
+  color: #54514a;
 }

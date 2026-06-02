@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, Notification, clipboard, screen, safeStorage, globalShortcut, dialog } = require("electron");
+const { app, BrowserWindow, Tray, Menu, ipcMain, Notification, clipboard, screen, safeStorage, globalShortcut, dialog, shell } = require("electron");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
@@ -25,6 +25,7 @@ let bubbleWindow = null;
 let panelWindow = null;
 let tray = null;
 let isQuitting = false;
+let isDialogOpen = false;
 let storePath;
 let attachmentDir;
 let saveTimer = null;
@@ -33,7 +34,8 @@ let state = {
   settings: { ...DEFAULT_SETTINGS },
   sessions: [],
 };
-// sessionId -> { runId, controller }. controller.idleTimedOut marks a timeout abort.
+// sessionId -> { runId, controller, idleTimedOut }. idleTimedOut distinguishes a
+// timeout abort from a user-initiated cancel.
 const activeRuns = new Map();
 
 const hasInstanceLock = app.requestSingleInstanceLock();
@@ -227,11 +229,21 @@ function makeVisibleEverywhere(win) {
   if (isMac) win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
 }
 
+// Open external links (e.g. from rendered Markdown) in the system browser
+// instead of spawning an in-app window.
+function attachExternalLinkHandler(win) {
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url);
+    return { action: "deny" };
+  });
+}
+
 function createBubbleWindow() {
   bubbleWindow = new BrowserWindow(
     windowOptions({ width: BUBBLE_SIZE, height: BUBBLE_SIZE, minWidth: BUBBLE_SIZE, minHeight: BUBBLE_SIZE })
   );
   makeVisibleEverywhere(bubbleWindow);
+  attachExternalLinkHandler(bubbleWindow);
   bubbleWindow.loadFile(path.join(__dirname, "bubble.html"));
   const primary = screen.getPrimaryDisplay().workArea;
   bubbleWindow.setPosition(
@@ -249,8 +261,13 @@ function createPanelWindow() {
     windowOptions({ width: PANEL_WIDTH, height: PANEL_HEIGHT, minWidth: PANEL_WIDTH, minHeight: PANEL_HEIGHT })
   );
   makeVisibleEverywhere(panelWindow);
+  attachExternalLinkHandler(panelWindow);
   panelWindow.loadFile(path.join(__dirname, "renderer.html"));
-  panelWindow.on("blur", () => collapse());
+  panelWindow.on("blur", () => {
+    // Don't collapse while a native modal (e.g. the export save dialog) is up.
+    if (isDialogOpen) return;
+    collapse();
+  });
   panelWindow.on("close", (event) => {
     if (!isQuitting) {
       event.preventDefault();
@@ -380,7 +397,7 @@ function handleSseEvent(event, sessionId, ref) {
   }
 }
 
-async function consumeStream(response, sessionId, controller) {
+async function consumeStream(response, sessionId, run) {
   const decoder = new TextDecoder();
   let buffer = "";
   const ref = { assistantMessageId: null };
@@ -388,8 +405,8 @@ async function consumeStream(response, sessionId, controller) {
   const resetIdle = () => {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
-      controller.idleTimedOut = true;
-      controller.abort();
+      run.idleTimedOut = true;
+      run.controller.abort();
     }, SSE_IDLE_TIMEOUT_MS);
   };
   resetIdle();
@@ -413,23 +430,23 @@ async function consumeStream(response, sessionId, controller) {
 // Connects to the run's event stream with limited connect-retry. Mid-stream we
 // do NOT reconnect (would replay deltas → duplicates); instead an idle timeout
 // aborts a stuck stream so the caller can surface a timeout.
-async function streamRun(runId, sessionId, controller) {
+async function streamRun(runId, sessionId, run) {
   const url = `${state.settings.apiBaseUrl.replace(/\/$/, "")}/v1/runs/${runId}/events`;
   let response = null;
   let attempt = 0;
   while (true) {
-    if (controller.signal.aborted) throw new Error("aborted");
+    if (run.controller.signal.aborted) throw new Error("aborted");
     try {
-      response = await fetch(url, { headers: getHeaders(), signal: controller.signal });
+      response = await fetch(url, { headers: getHeaders(), signal: run.controller.signal });
       if (!response.ok || !response.body) throw new Error(`事件流连接失败：HTTP ${response.status}`);
       break;
     } catch (err) {
-      if (controller.signal.aborted) throw err;
+      if (run.controller.signal.aborted) throw err;
       if (++attempt >= SSE_CONNECT_ATTEMPTS) throw err;
       await delay(400 * attempt);
     }
   }
-  await consumeStream(response, sessionId, controller);
+  await consumeStream(response, sessionId, run);
 }
 
 async function sendMessage(_event, payload) {
@@ -460,8 +477,7 @@ async function sendMessage(_event, payload) {
     .filter((msg) => msg.role === "user" || msg.role === "assistant")
     .map((msg) => ({ role: msg.role, content: msg.content }));
 
-  const controller = new AbortController();
-  controller.idleTimedOut = false;
+  const run = { runId: null, controller: new AbortController(), idleTimedOut: false };
 
   const response = await fetch(`${state.settings.apiBaseUrl.replace(/\/$/, "")}/v1/runs`, {
     method: "POST",
@@ -471,27 +487,28 @@ async function sendMessage(_event, payload) {
       session_id: session.hermesSessionId,
       conversation_history: history,
     }),
-    signal: controller.signal,
+    signal: run.controller.signal,
   });
   if (!response.ok) {
     const body = await response.text();
     throw new Error(`Hermes 请求失败：HTTP ${response.status} ${body}`);
   }
-  const run = await response.json();
-  activeRuns.set(session.id, { runId: run.run_id, controller });
+  const result = await response.json();
+  run.runId = result.run_id;
+  activeRuns.set(session.id, run);
   broadcastBusy();
 
-  streamRun(run.run_id, session.id, controller).catch((error) => {
+  streamRun(result.run_id, session.id, run).catch((error) => {
     const failed = getSession(session.id);
     if (!failed) return;
     if (!activeRuns.has(session.id)) return; // already finalized by run.completed/failed
-    const stoppedByUser = controller.signal.aborted && !controller.idleTimedOut;
+    const stoppedByUser = run.controller.signal.aborted && !run.idleTimedOut;
     const pending = failed.messages.find((msg) => msg.pending);
     if (pending) pending.pending = false;
     if (stoppedByUser) {
       failed.messages.push({ id: makeId("msg"), role: "system", content: "已停止生成", createdAt: nowIso() });
     } else {
-      const reason = controller.idleTimedOut ? "响应超时，请重试" : error.message;
+      const reason = run.idleTimedOut ? "响应超时，请重试" : error.message;
       failed.messages.push({ id: makeId("msg"), role: "system", content: reason, createdAt: nowIso() });
     }
     failed.completedAt = nowIso();
@@ -502,15 +519,15 @@ async function sendMessage(_event, payload) {
     sendEvent("state-changed", publicState());
     sendEvent("run-event", {
       sessionId: session.id,
-      event: { event: "run.failed", error: stoppedByUser ? "stopped" : controller.idleTimedOut ? "timeout" : error.message },
+      event: { event: "run.failed", error: stoppedByUser ? "stopped" : run.idleTimedOut ? "timeout" : error.message },
     });
   });
   return { state: publicState(), sessionId: session.id };
 }
 
 function cancelRun(_event, sessionId) {
-  const entry = activeRuns.get(sessionId);
-  if (entry && entry.controller) entry.controller.abort();
+  const run = activeRuns.get(sessionId);
+  if (run && run.controller) run.controller.abort();
   return publicState();
 }
 
@@ -532,8 +549,8 @@ async function testConnection(_event, payload) {
 function deleteSession(_event, sessionId) {
   const index = state.sessions.findIndex((session) => session.id === sessionId);
   if (index === -1) return publicState();
-  const entry = activeRuns.get(sessionId);
-  if (entry && entry.controller) entry.controller.abort();
+  const run = activeRuns.get(sessionId);
+  if (run && run.controller) run.controller.abort();
   activeRuns.delete(sessionId);
   state.sessions.splice(index, 1);
   flushState();
@@ -560,14 +577,19 @@ async function exportSession(_event, sessionId) {
     lines.push(`## ${who}`, "", msg.content || "", "");
   }
   const safeName = (session.title || "session").replace(/[\\/:*?"<>|]/g, "_").slice(0, 40);
-  const result = await dialog.showSaveDialog(panelWindow || undefined, {
-    title: "导出会话",
-    defaultPath: `${safeName}.md`,
-    filters: [{ name: "Markdown", extensions: ["md"] }],
-  });
-  if (result.canceled || !result.filePath) return { ok: false };
-  fs.writeFileSync(result.filePath, lines.join("\n"), "utf8");
-  return { ok: true, path: result.filePath };
+  isDialogOpen = true;
+  try {
+    const result = await dialog.showSaveDialog(panelWindow || undefined, {
+      title: "导出会话",
+      defaultPath: `${safeName}.md`,
+      filters: [{ name: "Markdown", extensions: ["md"] }],
+    });
+    if (result.canceled || !result.filePath) return { ok: false };
+    fs.writeFileSync(result.filePath, lines.join("\n"), "utf8");
+    return { ok: true, path: result.filePath };
+  } finally {
+    isDialogOpen = false;
+  }
 }
 
 function classifyPaths(paths) {
@@ -643,6 +665,10 @@ if (!hasInstanceLock) {
     ipcMain.handle("message:send", sendMessage);
     ipcMain.handle("run:cancel", cancelRun);
     ipcMain.handle("connection:test", testConnection);
+    ipcMain.handle("clipboard:write-text", (_event, text) => {
+      clipboard.writeText(String(text == null ? "" : text));
+      return true;
+    });
     ipcMain.handle("paths:drop", (_event, payload) => {
       const { folders, files } = classifyPaths(payload?.paths || []);
       let session = payload?.sessionId ? getSession(payload.sessionId) : null;

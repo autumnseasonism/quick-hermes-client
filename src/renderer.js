@@ -39,7 +39,7 @@ const apiBaseUrl = document.getElementById("apiBaseUrl");
 const apiKey = document.getElementById("apiKey");
 const idleMinutes = document.getElementById("idleMinutes");
 const launchAtLogin = document.getElementById("launchAtLogin");
-const themeSelect = document.getElementById("themeSelect");
+const themeSeg = document.getElementById("themeSeg");
 const hotkeyInput = document.getElementById("hotkeyInput");
 const testConnBtn = document.getElementById("testConnBtn");
 const testConnResult = document.getElementById("testConnResult");
@@ -54,6 +54,20 @@ function applyTheme(theme) {
   document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
 }
 darkQuery.addEventListener("change", () => applyTheme());
+
+let selectedTheme = "system";
+function setThemeSeg(value) {
+  selectedTheme = value || "system";
+  for (const btn of themeSeg.querySelectorAll(".seg-btn")) {
+    btn.classList.toggle("active", btn.dataset.value === selectedTheme);
+  }
+}
+themeSeg.addEventListener("click", (event) => {
+  const btn = event.target.closest(".seg-btn");
+  if (!btn) return;
+  setThemeSeg(btn.dataset.value);
+  applyTheme(selectedTheme);
+});
 
 function currentSession() {
   return state.sessions.find((session) => session.id === activeSessionId) || state.sessions[0] || null;
@@ -85,7 +99,7 @@ function decorateCodeBlocks(container) {
     btn.addEventListener("click", (event) => {
       event.stopPropagation();
       const code = pre.querySelector("code");
-      navigator.clipboard.writeText(code ? code.textContent : "").then(() => {
+      api.copyText(code ? code.textContent : "").then(() => {
         btn.textContent = "已复制";
         setTimeout(() => (btn.textContent = "复制"), 1200);
       });
@@ -244,7 +258,7 @@ function renderSettings() {
   apiKey.value = state.settings.apiKey || "";
   idleMinutes.value = state.settings.idleMinutes || 30;
   launchAtLogin.checked = Boolean(state.settings.launchAtLogin);
-  themeSelect.value = state.settings.theme || "system";
+  setThemeSeg(state.settings.theme || "system");
   hotkeyInput.value = state.settings.hotkey || "";
 }
 
@@ -337,7 +351,7 @@ saveSettingsBtn.addEventListener("click", async () => {
     apiKey: apiKey.value,
     idleMinutes: idleMinutes.value,
     launchAtLogin: launchAtLogin.checked,
-    theme: themeSelect.value,
+    theme: selectedTheme,
     hotkey: hotkeyInput.value,
   });
   applyTheme(state.settings.theme);
