@@ -403,12 +403,10 @@ document.addEventListener("dragover", (event) => {
 document.addEventListener("dragleave", () => appEl.classList.remove("drop-ready"));
 panel.addEventListener("drop", (event) => handleDrop(event));
 
-window.addEventListener("blur", () => {
-  if (document.activeElement && document.activeElement.tagName === "INPUT" && document.activeElement.classList.contains("rename-input")) {
-    return;
-  }
-  api.collapse();
-});
+// Auto-collapse on blur is owned by the main process (panelWindow "blur"),
+// which also guards against native modals via isDialogOpen — see main.js.
+// The renderer must NOT collapse on its own blur, or the export save dialog
+// (and other native popups) would dismiss the panel.
 
 api.onStateChanged((nextState) => {
   state = nextState;
@@ -444,6 +442,9 @@ api.onPanelShown(({ sessionId, state: nextState }) => {
   focusInput();
 });
 api.onThemeChanged(({ theme }) => applyTheme(theme));
+api.onHotkeyResult(({ ok, hotkey }) => {
+  if (!ok) statusLine.textContent = "热键 " + hotkey + " 注册失败（可能被占用）";
+});
 
 api.getState().then((nextState) => {
   state = nextState;

@@ -29,4 +29,5 @@ contextBridge.exposeInMainWorld("quickHermes", {
   onPanelShown: (callback) => subscribe("panel-shown", callback),
   onBusyChanged: (callback) => subscribe("busy-changed", callback),
   onThemeChanged: (callback) => subscribe("theme-changed", callback),
+  onHotkeyResult: (callback) => subscribe("hotkey-result", callback),
 });

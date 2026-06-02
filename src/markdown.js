@@ -8,7 +8,8 @@
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
   }
 
   function safeUrl(url) {
@@ -29,7 +30,7 @@
       let seg = parts[i];
       seg = seg.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_m, label, url) => {
         const safe = safeUrl(url);
-        return safe ? `<a href="${safe}" target="_blank" rel="noreferrer">${label}</a>` : label;
+        return safe ? `<a href="${safe}" target="_blank" rel="noopener noreferrer">${label}</a>` : label;
       });
       seg = seg.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
       seg = seg.replace(/__([^_]+)__/g, "<strong>$1</strong>");

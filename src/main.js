@@ -30,6 +30,11 @@ let storePath;
 let attachmentDir;
 let saveTimer = null;
 let registeredHotkey = "";
+// When the stored apiKey cipher cannot be decrypted (e.g. moved machines /
+// keyring changed) we keep the original cipher and refuse to overwrite it with
+// an empty value, so the key is never silently destroyed.
+let apiKeyDecryptFailed = false;
+let apiKeyCipherOnDisk = null;
 let state = {
   settings: { ...DEFAULT_SETTINGS },
   sessions: [],
@@ -78,19 +83,27 @@ function encryptApiKey(plain) {
   return plain;
 }
 
+// Returns { value, failed }. failed=true means the stored cipher could not be
+// decrypted and must be preserved rather than overwritten.
 function decryptApiKey(stored) {
-  if (!stored || typeof stored !== "string") return "";
-  if (!stored.startsWith("enc:")) return stored; // legacy plaintext — migrated on next save
+  if (!stored || typeof stored !== "string") return { value: "", failed: false };
+  if (!stored.startsWith("enc:")) return { value: stored, failed: false }; // legacy plaintext
   try {
-    return safeStorage.decryptString(Buffer.from(stored.slice(4), "base64"));
+    return { value: safeStorage.decryptString(Buffer.from(stored.slice(4), "base64")), failed: false };
   } catch {
-    return "";
+    return { value: "", failed: true };
   }
 }
 
 function serializeState() {
+  let apiKeyOnDisk;
+  if (apiKeyDecryptFailed && apiKeyCipherOnDisk) {
+    apiKeyOnDisk = apiKeyCipherOnDisk; // preserve un-decryptable cipher; never clobber it
+  } else {
+    apiKeyOnDisk = encryptApiKey(state.settings.apiKey);
+  }
   return {
-    settings: { ...state.settings, apiKey: encryptApiKey(state.settings.apiKey) },
+    settings: { ...state.settings, apiKey: apiKeyOnDisk },
     sessions: state.sessions,
   };
 }
@@ -101,11 +114,15 @@ function loadState() {
   attachmentDir = path.join(userData, "attachments");
   fs.mkdirSync(attachmentDir, { recursive: true });
   const loaded = readJson(storePath, {});
+  const rawKey = loaded.settings?.apiKey;
+  const decrypted = decryptApiKey(rawKey);
+  apiKeyDecryptFailed = decrypted.failed;
+  apiKeyCipherOnDisk = decrypted.failed && typeof rawKey === "string" ? rawKey : null;
   state = {
     settings: {
       ...DEFAULT_SETTINGS,
       ...(loaded.settings || {}),
-      apiKey: decryptApiKey(loaded.settings?.apiKey),
+      apiKey: decrypted.value,
     },
     sessions: Array.isArray(loaded.sessions) ? loaded.sessions : [],
   };
@@ -352,9 +369,14 @@ function notifyCompleted(session) {
   notification.show();
 }
 
-function handleSseEvent(event, sessionId, ref) {
+// `run` is the activeRuns record this stream belongs to. Terminal bookkeeping
+// (completedAt / activeRuns.delete) only happens when the session's current run
+// is still this one — guards against a stale stream's late events clobbering a
+// newer run on the same session.
+function handleSseEvent(event, sessionId, ref, run) {
   const session = getSession(sessionId);
   if (!session) return;
+  const isCurrent = activeRuns.get(sessionId) === run;
   if (event.event === "message.delta") {
     if (!ref.assistantMessageId) {
       ref.assistantMessageId = makeId("msg");
@@ -377,23 +399,35 @@ function handleSseEvent(event, sessionId, ref) {
       msg.pending = false;
       if (!msg.content && event.output) msg.content = event.output;
     }
-    session.completedAt = nowIso();
-    session.updatedAt = session.completedAt;
-    activeRuns.delete(sessionId);
-    flushState();
-    broadcastBusy();
-    sendEvent("state-changed", publicState());
-    sendEvent("run-event", { sessionId, event });
-    notifyCompleted(session);
+    if (isCurrent) {
+      session.completedAt = nowIso();
+      session.updatedAt = session.completedAt;
+      activeRuns.delete(sessionId);
+      flushState();
+      broadcastBusy();
+      sendEvent("state-changed", publicState());
+      sendEvent("run-event", { sessionId, event });
+      notifyCompleted(session);
+    } else {
+      saveState();
+      sendEvent("state-changed", publicState());
+    }
   } else if (event.event === "run.failed") {
-    session.messages.push({ id: makeId("msg"), role: "system", content: `运行失败：${event.error || "未知错误"}`, createdAt: nowIso() });
-    session.completedAt = nowIso();
-    session.updatedAt = session.completedAt;
-    activeRuns.delete(sessionId);
-    flushState();
-    broadcastBusy();
-    sendEvent("state-changed", publicState());
-    sendEvent("run-event", { sessionId, event });
+    if (isCurrent) {
+      session.messages.push({ id: makeId("msg"), role: "system", content: `运行失败：${event.error || "未知错误"}`, createdAt: nowIso() });
+      session.completedAt = nowIso();
+      session.updatedAt = session.completedAt;
+      activeRuns.delete(sessionId);
+      flushState();
+      broadcastBusy();
+      sendEvent("state-changed", publicState());
+      sendEvent("run-event", { sessionId, event });
+    } else {
+      const msg = ref.assistantMessageId ? session.messages.find((item) => item.id === ref.assistantMessageId) : null;
+      if (msg) msg.pending = false;
+      saveState();
+      sendEvent("state-changed", publicState());
+    }
   }
 }
 
@@ -419,7 +453,7 @@ async function consumeStream(response, sessionId, run) {
       for (const frame of frames) {
         const dataLine = frame.split("\n").find((line) => line.startsWith("data: "));
         if (!dataLine) continue;
-        handleSseEvent(JSON.parse(dataLine.slice(6)), sessionId, ref);
+        handleSseEvent(JSON.parse(dataLine.slice(6)), sessionId, ref, run);
       }
     }
   } finally {
@@ -447,6 +481,14 @@ async function streamRun(runId, sessionId, run) {
     }
   }
   await consumeStream(response, sessionId, run);
+}
+
+function finalizeStopped(session) {
+  const pending = session.messages.find((msg) => msg.pending);
+  if (pending) pending.pending = false;
+  session.messages.push({ id: makeId("msg"), role: "system", content: "已停止生成", createdAt: nowIso() });
+  session.completedAt = nowIso();
+  session.updatedAt = session.completedAt;
 }
 
 async function sendMessage(_event, payload) {
@@ -477,31 +519,50 @@ async function sendMessage(_event, payload) {
     .filter((msg) => msg.role === "user" || msg.role === "assistant")
     .map((msg) => ({ role: msg.role, content: msg.content }));
 
+  // Register the run BEFORE the POST so a "stop" during the initial request can
+  // abort the in-flight fetch.
   const run = { runId: null, controller: new AbortController(), idleTimedOut: false };
+  activeRuns.set(session.id, run);
+  broadcastBusy();
 
-  const response = await fetch(`${state.settings.apiBaseUrl.replace(/\/$/, "")}/v1/runs`, {
-    method: "POST",
-    headers: getHeaders(),
-    body: JSON.stringify({
-      input: fullText,
-      session_id: session.hermesSessionId,
-      conversation_history: history,
-    }),
-    signal: run.controller.signal,
-  });
+  let response;
+  try {
+    response = await fetch(`${state.settings.apiBaseUrl.replace(/\/$/, "")}/v1/runs`, {
+      method: "POST",
+      headers: getHeaders(),
+      body: JSON.stringify({
+        input: fullText,
+        session_id: session.hermesSessionId,
+        conversation_history: history,
+      }),
+      signal: run.controller.signal,
+    });
+  } catch (err) {
+    activeRuns.delete(session.id);
+    broadcastBusy();
+    if (run.controller.signal.aborted) {
+      finalizeStopped(session);
+      flushState();
+      sendEvent("state-changed", publicState());
+      sendEvent("run-event", { sessionId: session.id, event: { event: "run.failed", error: "stopped" } });
+      return { state: publicState(), sessionId: session.id };
+    }
+    flushState();
+    throw err;
+  }
   if (!response.ok) {
+    activeRuns.delete(session.id);
+    broadcastBusy();
     const body = await response.text();
     throw new Error(`Hermes 请求失败：HTTP ${response.status} ${body}`);
   }
   const result = await response.json();
   run.runId = result.run_id;
-  activeRuns.set(session.id, run);
-  broadcastBusy();
 
   streamRun(result.run_id, session.id, run).catch((error) => {
     const failed = getSession(session.id);
     if (!failed) return;
-    if (!activeRuns.has(session.id)) return; // already finalized by run.completed/failed
+    if (activeRuns.get(session.id) !== run) return; // already finalized or superseded
     const stoppedByUser = run.controller.signal.aborted && !run.idleTimedOut;
     const pending = failed.messages.find((msg) => msg.pending);
     if (pending) pending.pending = false;
@@ -641,6 +702,7 @@ if (!hasInstanceLock) {
 
   app.whenReady().then(() => {
     if (process.platform === "win32") app.setAppUserModelId("com.quickhermes.client");
+    if (isMac && app.dock) app.dock.hide(); // tray-resident floating app; no dock icon
     loadState();
     createBubbleWindow();
     createPanelWindow();
@@ -688,7 +750,13 @@ if (!hasInstanceLock) {
     });
     ipcMain.handle("clipboard:save-image", () => saveClipboardImage());
     ipcMain.handle("settings:save", (_event, nextSettings) => {
-      const apiKey = nextSettings.apiKey === "********" ? state.settings.apiKey : String(nextSettings.apiKey || "");
+      const userChangedKey = nextSettings.apiKey !== "********";
+      const apiKey = userChangedKey ? String(nextSettings.apiKey || "") : state.settings.apiKey;
+      if (userChangedKey) {
+        // User typed a fresh key; stop preserving the old un-decryptable cipher.
+        apiKeyDecryptFailed = false;
+        apiKeyCipherOnDisk = null;
+      }
       const theme = ["system", "light", "dark"].includes(nextSettings.theme) ? nextSettings.theme : "system";
       const hotkey = String(nextSettings.hotkey || DEFAULT_SETTINGS.hotkey);
       state.settings = {
@@ -701,9 +769,10 @@ if (!hasInstanceLock) {
         hotkey,
       };
       app.setLoginItemSettings({ openAtLogin: state.settings.launchAtLogin, path: process.execPath });
-      registerHotkey(hotkey);
+      const hotkeyOk = registerHotkey(hotkey);
       flushState();
       sendEvent("theme-changed", { theme });
+      sendEvent("hotkey-result", { ok: hotkeyOk, hotkey });
       return publicState();
     });
     ipcMain.handle("settings:login-item", () => app.getLoginItemSettings());
