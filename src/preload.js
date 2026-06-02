@@ -1,39 +1,33 @@
 const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
+function subscribe(channel, callback) {
+  const listener = (_event, payload) => callback(payload);
+  ipcRenderer.on(channel, listener);
+  return () => ipcRenderer.removeListener(channel, listener);
+}
+
 contextBridge.exposeInMainWorld("quickHermes", {
   getState: () => ipcRenderer.invoke("app:get-state"),
   expand: () => ipcRenderer.invoke("window:expand"),
   collapse: () => ipcRenderer.invoke("window:collapse"),
   ensureFreshSession: () => ipcRenderer.invoke("session:ensure-fresh"),
   newSession: (seed) => ipcRenderer.invoke("session:new", seed),
+  deleteSession: (sessionId) => ipcRenderer.invoke("session:delete", sessionId),
+  renameSession: (payload) => ipcRenderer.invoke("session:rename", payload),
+  exportSession: (sessionId) => ipcRenderer.invoke("session:export", sessionId),
   sendMessage: (payload) => ipcRenderer.invoke("message:send", payload),
+  cancelRun: (sessionId) => ipcRenderer.invoke("run:cancel", sessionId),
+  testConnection: (payload) => ipcRenderer.invoke("connection:test", payload),
+  copyText: (text) => ipcRenderer.invoke("clipboard:write-text", text),
   dropPaths: (payload) => ipcRenderer.invoke("paths:drop", payload),
   saveClipboardImage: () => ipcRenderer.invoke("clipboard:save-image"),
   saveSettings: (settings) => ipcRenderer.invoke("settings:save", settings),
   filePath: (file) => webUtils.getPathForFile(file),
-  onStateChanged: (callback) => {
-    const listener = (_event, payload) => callback(payload);
-    ipcRenderer.on("state-changed", listener);
-    return () => ipcRenderer.removeListener("state-changed", listener);
-  },
-  onRunEvent: (callback) => {
-    const listener = (_event, payload) => callback(payload);
-    ipcRenderer.on("run-event", listener);
-    return () => ipcRenderer.removeListener("run-event", listener);
-  },
-  onOpenSession: (callback) => {
-    const listener = (_event, payload) => callback(payload);
-    ipcRenderer.on("open-session", listener);
-    return () => ipcRenderer.removeListener("open-session", listener);
-  },
-  onPanelShown: (callback) => {
-    const listener = (_event, payload) => callback(payload);
-    ipcRenderer.on("panel-shown", listener);
-    return () => ipcRenderer.removeListener("panel-shown", listener);
-  },
-  onBusyChanged: (callback) => {
-    const listener = (_event, payload) => callback(payload);
-    ipcRenderer.on("busy-changed", listener);
-    return () => ipcRenderer.removeListener("busy-changed", listener);
-  },
+  onStateChanged: (callback) => subscribe("state-changed", callback),
+  onRunEvent: (callback) => subscribe("run-event", callback),
+  onOpenSession: (callback) => subscribe("open-session", callback),
+  onPanelShown: (callback) => subscribe("panel-shown", callback),
+  onBusyChanged: (callback) => subscribe("busy-changed", callback),
+  onThemeChanged: (callback) => subscribe("theme-changed", callback),
+  onHotkeyResult: (callback) => subscribe("hotkey-result", callback),
 });

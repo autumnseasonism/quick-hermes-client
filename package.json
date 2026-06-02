@@ -1,11 +1,11 @@
 {
   "name": "quick-hermes-client",
   "version": "1.0.0",
-  "description": "A lightweight floating macOS client for Hermes Agent.",
+  "description": "A lightweight cross-platform floating client for Hermes Agent.",
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
-    "check": "node --check src/main.js && node --check src/preload.js && node --check src/renderer.js && node --check src/bubble.js",
+    "check": "node --check src/main.js && node --check src/preload.js && node --check src/renderer.js && node --check src/bubble.js && node --check src/markdown.js",
     "pack": "electron-builder --dir",
     "dist": "electron-builder",
     "pack:mac": "electron-builder --mac --dir",
@@ -16,7 +16,7 @@
   "keywords": [
     "hermes-agent",
     "electron",
-    "macos",
+    "cross-platform",
     "floating-window",
     "ai-agent"
   ],

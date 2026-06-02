@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, Notification, clipboard, screen } = require("electron");
+const { app, BrowserWindow, Tray, Menu, ipcMain, Notification, clipboard, screen, safeStorage, globalShortcut, dialog, shell } = require("electron");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
@@ -8,25 +8,42 @@ const BUBBLE_SIZE = 72;
 const PANEL_WIDTH = 430;
 const PANEL_HEIGHT = 640;
 const EDGE_MARGIN = 24;
+const SAVE_DEBOUNCE_MS = 300;
+const SSE_IDLE_TIMEOUT_MS = 90000;
+const SSE_CONNECT_ATTEMPTS = 3;
 
 const DEFAULT_SETTINGS = {
   apiBaseUrl: "http://127.0.0.1:8642",
   apiKey: "",
   idleMinutes: 30,
   launchAtLogin: false,
+  theme: "system",
+  hotkey: "CommandOrControl+Shift+H",
 };
 
 let bubbleWindow = null;
 let panelWindow = null;
 let tray = null;
 let isQuitting = false;
+let isDialogOpen = false;
 let storePath;
 let attachmentDir;
+let saveTimer = null;
+let registeredHotkey = "";
+// When the stored apiKey cipher cannot be decrypted (e.g. moved machines /
+// keyring changed) we keep the original cipher and refuse to overwrite it with
+// an empty value, so the key is never silently destroyed.
+let apiKeyDecryptFailed = false;
+let apiKeyCipherOnDisk = null;
 let state = {
   settings: { ...DEFAULT_SETTINGS },
   sessions: [],
 };
+// sessionId -> { runId, controller, idleTimedOut }. idleTimedOut distinguishes a
+// timeout abort from a user-initiated cancel.
 const activeRuns = new Map();
+
+const hasInstanceLock = app.requestSingleInstanceLock();
 
 function nowIso() {
   return new Date().toISOString();
@@ -34,6 +51,10 @@ function nowIso() {
 
 function makeId(prefix) {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "")}`;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function readJson(filePath, fallback) {
@@ -49,24 +70,88 @@ function writeJson(filePath, value) {
   fs.writeFileSync(filePath, JSON.stringify(value, null, 2));
 }
 
+// --- apiKey at-rest encryption (safeStorage). Plaintext in memory, ciphertext on disk. ---
+function encryptApiKey(plain) {
+  if (!plain) return "";
+  try {
+    if (safeStorage.isEncryptionAvailable()) {
+      return `enc:${safeStorage.encryptString(plain).toString("base64")}`;
+    }
+  } catch {
+    // fall through to plaintext when encryption is unavailable (e.g. no keyring on Linux)
+  }
+  return plain;
+}
+
+// Returns { value, failed }. failed=true means the stored cipher could not be
+// decrypted and must be preserved rather than overwritten.
+function decryptApiKey(stored) {
+  if (!stored || typeof stored !== "string") return { value: "", failed: false };
+  if (!stored.startsWith("enc:")) return { value: stored, failed: false }; // legacy plaintext
+  try {
+    return { value: safeStorage.decryptString(Buffer.from(stored.slice(4), "base64")), failed: false };
+  } catch {
+    return { value: "", failed: true };
+  }
+}
+
+function serializeState() {
+  let apiKeyOnDisk;
+  if (apiKeyDecryptFailed && apiKeyCipherOnDisk) {
+    apiKeyOnDisk = apiKeyCipherOnDisk; // preserve un-decryptable cipher; never clobber it
+  } else {
+    apiKeyOnDisk = encryptApiKey(state.settings.apiKey);
+  }
+  return {
+    settings: { ...state.settings, apiKey: apiKeyOnDisk },
+    sessions: state.sessions,
+  };
+}
+
 function loadState() {
   const userData = app.getPath("userData");
   storePath = path.join(userData, "quick-hermes-state.json");
   attachmentDir = path.join(userData, "attachments");
   fs.mkdirSync(attachmentDir, { recursive: true });
   const loaded = readJson(storePath, {});
+  const rawKey = loaded.settings?.apiKey;
+  const decrypted = decryptApiKey(rawKey);
+  apiKeyDecryptFailed = decrypted.failed;
+  apiKeyCipherOnDisk = decrypted.failed && typeof rawKey === "string" ? rawKey : null;
   state = {
-    settings: { ...DEFAULT_SETTINGS, ...(loaded.settings || {}) },
+    settings: {
+      ...DEFAULT_SETTINGS,
+      ...(loaded.settings || {}),
+      apiKey: decrypted.value,
+    },
     sessions: Array.isArray(loaded.sessions) ? loaded.sessions : [],
   };
 }
 
+// Debounced write to avoid blocking the main process on every streamed delta.
 function saveState() {
-  writeJson(storePath, state);
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    writeJson(storePath, serializeState());
+  }, SAVE_DEBOUNCE_MS);
+}
+
+// Immediate write for important checkpoints (completion, settings, quit).
+function flushState() {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  if (storePath) writeJson(storePath, serializeState());
 }
 
 function publicState() {
-  const settings = { ...state.settings, apiKey: state.settings.apiKey ? "********" : "" };
+  // Mask as set when a key is present OR when a stored cipher couldn't be
+  // decrypted — otherwise the UI shows an empty field that would round-trip
+  // back as "clear the key" and overwrite the preserved cipher.
+  const hasKey = Boolean(state.settings.apiKey) || apiKeyDecryptFailed;
+  const settings = { ...state.settings, apiKey: hasKey ? "********" : "" };
   return { settings, sessions: state.sessions };
 }
 
@@ -137,10 +222,7 @@ function buildUserContent(session, text, extra = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// Window management — dual-window architecture (bubble + panel).
-// Two fixed-size windows toggled by show/hide instead of resizing a single
-// transparent window, which avoids the flicker/black-edge issues that a
-// transparent BrowserWindow hits on Windows when resized.
+// Dual-window architecture (bubble + panel), toggled by show/hide.
 // ---------------------------------------------------------------------------
 
 function windowOptions(extra) {
@@ -165,8 +247,16 @@ function windowOptions(extra) {
 }
 
 function makeVisibleEverywhere(win) {
-  // macOS Spaces-only API; on Windows/Linux it is a no-op, so guard it.
   if (isMac) win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+}
+
+// Open external links (e.g. from rendered Markdown) in the system browser
+// instead of spawning an in-app window.
+function attachExternalLinkHandler(win) {
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url);
+    return { action: "deny" };
+  });
 }
 
 function createBubbleWindow() {
@@ -174,6 +264,7 @@ function createBubbleWindow() {
     windowOptions({ width: BUBBLE_SIZE, height: BUBBLE_SIZE, minWidth: BUBBLE_SIZE, minHeight: BUBBLE_SIZE })
   );
   makeVisibleEverywhere(bubbleWindow);
+  attachExternalLinkHandler(bubbleWindow);
   bubbleWindow.loadFile(path.join(__dirname, "bubble.html"));
   const primary = screen.getPrimaryDisplay().workArea;
   bubbleWindow.setPosition(
@@ -191,8 +282,13 @@ function createPanelWindow() {
     windowOptions({ width: PANEL_WIDTH, height: PANEL_HEIGHT, minWidth: PANEL_WIDTH, minHeight: PANEL_HEIGHT })
   );
   makeVisibleEverywhere(panelWindow);
+  attachExternalLinkHandler(panelWindow);
   panelWindow.loadFile(path.join(__dirname, "renderer.html"));
-  panelWindow.on("blur", () => collapse());
+  panelWindow.on("blur", () => {
+    // Don't collapse while a native modal (e.g. the export save dialog) is up.
+    if (isDialogOpen) return;
+    collapse();
+  });
   panelWindow.on("close", (event) => {
     if (!isQuitting) {
       event.preventDefault();
@@ -208,7 +304,6 @@ function positionPanelNearBubble() {
   const wa = screen.getDisplayNearestPoint({ x: b.x, y: b.y }).workArea;
   let x = b.x;
   let y = b.y;
-  // Keep the whole panel inside the work area of the bubble's display.
   x = Math.max(wa.x, Math.min(x, wa.x + wa.width - PANEL_WIDTH));
   y = Math.max(wa.y, Math.min(y, wa.y + wa.height - PANEL_HEIGHT));
   panelWindow.setPosition(Math.round(x), Math.round(y));
@@ -278,66 +373,126 @@ function notifyCompleted(session) {
   notification.show();
 }
 
-async function readSse(runId, sessionId) {
-  const url = `${state.settings.apiBaseUrl.replace(/\/$/, "")}/v1/runs/${runId}/events`;
-  const response = await fetch(url, { headers: getHeaders() });
-  if (!response.ok || !response.body) throw new Error(`事件流连接失败：HTTP ${response.status}`);
-
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let assistantMessageId = null;
-  for await (const chunk of response.body) {
-    buffer += decoder.decode(chunk, { stream: true });
-    const frames = buffer.split("\n\n");
-    buffer = frames.pop() || "";
-    for (const frame of frames) {
-      const dataLine = frame.split("\n").find((line) => line.startsWith("data: "));
-      if (!dataLine) continue;
-      const event = JSON.parse(dataLine.slice(6));
-      const session = getSession(sessionId);
-      if (!session) continue;
-      if (event.event === "message.delta") {
-        if (!assistantMessageId) {
-          assistantMessageId = makeId("msg");
-          session.messages.push({ id: assistantMessageId, role: "assistant", content: "", createdAt: nowIso(), pending: true });
-        }
-        const msg = session.messages.find((item) => item.id === assistantMessageId);
-        if (msg) msg.content += event.delta || "";
-        session.updatedAt = nowIso();
-        saveState();
-        sendEvent("state-changed", publicState());
-      } else if (event.event === "tool.started" || event.event === "tool.completed" || event.event === "reasoning.available") {
-        sendEvent("run-event", { sessionId, event });
-      } else if (event.event === "run.completed") {
-        if (!assistantMessageId && event.output) {
-          assistantMessageId = makeId("msg");
-          session.messages.push({ id: assistantMessageId, role: "assistant", content: event.output, createdAt: nowIso(), pending: false });
-        }
-        const msg = session.messages.find((item) => item.id === assistantMessageId);
-        if (msg) {
-          msg.pending = false;
-          if (!msg.content && event.output) msg.content = event.output;
-        }
-        session.completedAt = nowIso();
-        session.updatedAt = session.completedAt;
-        saveState();
-        activeRuns.delete(sessionId);
-        broadcastBusy();
-        sendEvent("state-changed", publicState());
-        sendEvent("run-event", { sessionId, event });
-        notifyCompleted(session);
-      } else if (event.event === "run.failed") {
-        session.messages.push({ id: makeId("msg"), role: "system", content: `运行失败：${event.error || "未知错误"}`, createdAt: nowIso() });
-        session.completedAt = nowIso();
-        session.updatedAt = session.completedAt;
-        saveState();
-        activeRuns.delete(sessionId);
-        broadcastBusy();
-        sendEvent("state-changed", publicState());
-        sendEvent("run-event", { sessionId, event });
-      }
+// `run` is the activeRuns record this stream belongs to. Terminal bookkeeping
+// (completedAt / activeRuns.delete) only happens when the session's current run
+// is still this one — guards against a stale stream's late events clobbering a
+// newer run on the same session.
+function handleSseEvent(event, sessionId, ref, run) {
+  const session = getSession(sessionId);
+  if (!session) return;
+  const isCurrent = activeRuns.get(sessionId) === run;
+  if (event.event === "message.delta") {
+    if (!ref.assistantMessageId) {
+      ref.assistantMessageId = makeId("msg");
+      session.messages.push({ id: ref.assistantMessageId, role: "assistant", content: "", createdAt: nowIso(), pending: true });
+    }
+    const msg = session.messages.find((item) => item.id === ref.assistantMessageId);
+    if (msg) msg.content += event.delta || "";
+    session.updatedAt = nowIso();
+    saveState();
+    sendEvent("state-changed", publicState());
+  } else if (event.event === "tool.started" || event.event === "tool.completed" || event.event === "reasoning.available") {
+    sendEvent("run-event", { sessionId, event });
+  } else if (event.event === "run.completed") {
+    if (!ref.assistantMessageId && event.output) {
+      ref.assistantMessageId = makeId("msg");
+      session.messages.push({ id: ref.assistantMessageId, role: "assistant", content: event.output, createdAt: nowIso(), pending: false });
+    }
+    const msg = session.messages.find((item) => item.id === ref.assistantMessageId);
+    if (msg) {
+      msg.pending = false;
+      if (!msg.content && event.output) msg.content = event.output;
+    }
+    if (isCurrent) {
+      session.completedAt = nowIso();
+      session.updatedAt = session.completedAt;
+      activeRuns.delete(sessionId);
+      flushState();
+      broadcastBusy();
+      sendEvent("state-changed", publicState());
+      sendEvent("run-event", { sessionId, event });
+      notifyCompleted(session);
+    } else {
+      saveState();
+      sendEvent("state-changed", publicState());
+    }
+  } else if (event.event === "run.failed") {
+    if (isCurrent) {
+      session.messages.push({ id: makeId("msg"), role: "system", content: `运行失败：${event.error || "未知错误"}`, createdAt: nowIso() });
+      session.completedAt = nowIso();
+      session.updatedAt = session.completedAt;
+      activeRuns.delete(sessionId);
+      flushState();
+      broadcastBusy();
+      sendEvent("state-changed", publicState());
+      sendEvent("run-event", { sessionId, event });
+    } else {
+      const msg = ref.assistantMessageId ? session.messages.find((item) => item.id === ref.assistantMessageId) : null;
+      if (msg) msg.pending = false;
+      saveState();
+      sendEvent("state-changed", publicState());
     }
   }
+}
+
+async function consumeStream(response, sessionId, run) {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const ref = { assistantMessageId: null };
+  let idleTimer = null;
+  const resetIdle = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      run.idleTimedOut = true;
+      run.controller.abort();
+    }, SSE_IDLE_TIMEOUT_MS);
+  };
+  resetIdle();
+  try {
+    for await (const chunk of response.body) {
+      resetIdle();
+      buffer += decoder.decode(chunk, { stream: true });
+      const frames = buffer.split("\n\n");
+      buffer = frames.pop() || "";
+      for (const frame of frames) {
+        const dataLine = frame.split("\n").find((line) => line.startsWith("data: "));
+        if (!dataLine) continue;
+        handleSseEvent(JSON.parse(dataLine.slice(6)), sessionId, ref, run);
+      }
+    }
+  } finally {
+    if (idleTimer) clearTimeout(idleTimer);
+  }
+}
+
+// Connects to the run's event stream with limited connect-retry. Mid-stream we
+// do NOT reconnect (would replay deltas → duplicates); instead an idle timeout
+// aborts a stuck stream so the caller can surface a timeout.
+async function streamRun(runId, sessionId, run) {
+  const url = `${state.settings.apiBaseUrl.replace(/\/$/, "")}/v1/runs/${runId}/events`;
+  let response = null;
+  let attempt = 0;
+  while (true) {
+    if (run.controller.signal.aborted) throw new Error("aborted");
+    try {
+      response = await fetch(url, { headers: getHeaders(), signal: run.controller.signal });
+      if (!response.ok || !response.body) throw new Error(`事件流连接失败：HTTP ${response.status}`);
+      break;
+    } catch (err) {
+      if (run.controller.signal.aborted) throw err;
+      if (++attempt >= SSE_CONNECT_ATTEMPTS) throw err;
+      await delay(400 * attempt);
+    }
+  }
+  await consumeStream(response, sessionId, run);
+}
+
+function finalizeStopped(session) {
+  const pending = session.messages.find((msg) => msg.pending);
+  if (pending) pending.pending = false;
+  session.messages.push({ id: makeId("msg"), role: "system", content: "已停止生成", createdAt: nowIso() });
+  session.completedAt = nowIso();
+  session.updatedAt = session.completedAt;
 }
 
 async function sendMessage(_event, payload) {
@@ -367,35 +522,139 @@ async function sendMessage(_event, payload) {
     .slice(0, -1)
     .filter((msg) => msg.role === "user" || msg.role === "assistant")
     .map((msg) => ({ role: msg.role, content: msg.content }));
-  const response = await fetch(`${state.settings.apiBaseUrl.replace(/\/$/, "")}/v1/runs`, {
-    method: "POST",
-    headers: getHeaders(),
-    body: JSON.stringify({
-      input: fullText,
-      session_id: session.hermesSessionId,
-      conversation_history: history,
-    }),
-  });
+
+  // Register the run BEFORE the POST so a "stop" during the initial request can
+  // abort the in-flight fetch.
+  const run = { runId: null, controller: new AbortController(), idleTimedOut: false };
+  activeRuns.set(session.id, run);
+  broadcastBusy();
+
+  let response;
+  try {
+    response = await fetch(`${state.settings.apiBaseUrl.replace(/\/$/, "")}/v1/runs`, {
+      method: "POST",
+      headers: getHeaders(),
+      body: JSON.stringify({
+        input: fullText,
+        session_id: session.hermesSessionId,
+        conversation_history: history,
+      }),
+      signal: run.controller.signal,
+    });
+  } catch (err) {
+    activeRuns.delete(session.id);
+    broadcastBusy();
+    if (run.controller.signal.aborted) {
+      finalizeStopped(session);
+      flushState();
+      sendEvent("state-changed", publicState());
+      sendEvent("run-event", { sessionId: session.id, event: { event: "run.failed", error: "stopped" } });
+      return { state: publicState(), sessionId: session.id };
+    }
+    flushState();
+    throw err;
+  }
   if (!response.ok) {
+    activeRuns.delete(session.id);
+    broadcastBusy();
     const body = await response.text();
     throw new Error(`Hermes 请求失败：HTTP ${response.status} ${body}`);
   }
-  const run = await response.json();
-  activeRuns.set(session.id, run.run_id);
-  broadcastBusy();
-  readSse(run.run_id, session.id).catch((error) => {
+  const result = await response.json();
+  run.runId = result.run_id;
+
+  streamRun(result.run_id, session.id, run).catch((error) => {
     const failed = getSession(session.id);
     if (!failed) return;
-    failed.messages.push({ id: makeId("msg"), role: "system", content: error.message, createdAt: nowIso() });
+    if (activeRuns.get(session.id) !== run) return; // already finalized or superseded
+    const stoppedByUser = run.controller.signal.aborted && !run.idleTimedOut;
+    const pending = failed.messages.find((msg) => msg.pending);
+    if (pending) pending.pending = false;
+    if (stoppedByUser) {
+      failed.messages.push({ id: makeId("msg"), role: "system", content: "已停止生成", createdAt: nowIso() });
+    } else {
+      const reason = run.idleTimedOut ? "响应超时，请重试" : error.message;
+      failed.messages.push({ id: makeId("msg"), role: "system", content: reason, createdAt: nowIso() });
+    }
     failed.completedAt = nowIso();
     failed.updatedAt = failed.completedAt;
     activeRuns.delete(session.id);
     broadcastBusy();
-    saveState();
+    flushState();
     sendEvent("state-changed", publicState());
-    sendEvent("run-event", { sessionId: session.id, event: { event: "run.failed", error: error.message } });
+    sendEvent("run-event", {
+      sessionId: session.id,
+      event: { event: "run.failed", error: stoppedByUser ? "stopped" : run.idleTimedOut ? "timeout" : error.message },
+    });
   });
   return { state: publicState(), sessionId: session.id };
+}
+
+function cancelRun(_event, sessionId) {
+  const run = activeRuns.get(sessionId);
+  if (run && run.controller) run.controller.abort();
+  return publicState();
+}
+
+async function testConnection(_event, payload) {
+  const base = String(payload?.apiBaseUrl || state.settings.apiBaseUrl || "").replace(/\/$/, "");
+  if (!base) return { ok: false, message: "未配置 API 地址" };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const res = await fetch(base, { method: "GET", headers: getHeaders(), signal: controller.signal });
+    clearTimeout(timer);
+    return { ok: true, message: `已连接（HTTP ${res.status}）` };
+  } catch (err) {
+    clearTimeout(timer);
+    return { ok: false, message: controller.signal.aborted ? "连接超时" : `连接失败：${err.message}` };
+  }
+}
+
+function deleteSession(_event, sessionId) {
+  const index = state.sessions.findIndex((session) => session.id === sessionId);
+  if (index === -1) return publicState();
+  const run = activeRuns.get(sessionId);
+  if (run && run.controller) run.controller.abort();
+  activeRuns.delete(sessionId);
+  state.sessions.splice(index, 1);
+  flushState();
+  broadcastBusy();
+  return publicState();
+}
+
+function renameSession(_event, payload) {
+  const session = getSession(payload?.sessionId);
+  if (!session) return publicState();
+  const title = String(payload?.title || "").trim();
+  if (title) session.title = title.slice(0, 60);
+  session.updatedAt = nowIso();
+  flushState();
+  return publicState();
+}
+
+async function exportSession(_event, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) return { ok: false, message: "找不到该会话" };
+  const lines = [`# ${session.title || "会话"}`, ""];
+  for (const msg of session.messages) {
+    const who = msg.role === "user" ? "🧑 我" : msg.role === "assistant" ? "🤖 Hermes" : "ℹ️ 系统";
+    lines.push(`## ${who}`, "", msg.content || "", "");
+  }
+  const safeName = (session.title || "session").replace(/[\\/:*?"<>|]/g, "_").slice(0, 40);
+  isDialogOpen = true;
+  try {
+    const result = await dialog.showSaveDialog(panelWindow || undefined, {
+      title: "导出会话",
+      defaultPath: `${safeName}.md`,
+      filters: [{ name: "Markdown", extensions: ["md"] }],
+    });
+    if (result.canceled || !result.filePath) return { ok: false };
+    fs.writeFileSync(result.filePath, lines.join("\n"), "utf8");
+    return { ok: true, path: result.filePath };
+  } finally {
+    isDialogOpen = false;
+  }
 }
 
 function classifyPaths(paths) {
@@ -422,74 +681,123 @@ function saveClipboardImage() {
   return filePath;
 }
 
-app.whenReady().then(() => {
-  if (process.platform === "win32") app.setAppUserModelId("com.quickhermes.client");
-  loadState();
-  createBubbleWindow();
-  createPanelWindow();
-  createTray();
+function registerHotkey(accelerator) {
+  if (registeredHotkey) {
+    globalShortcut.unregister(registeredHotkey);
+    registeredHotkey = "";
+  }
+  const acc = String(accelerator || "").trim();
+  if (!acc) return true;
+  try {
+    if (globalShortcut.register(acc, () => toggle())) {
+      registeredHotkey = acc;
+      return true;
+    }
+  } catch {
+    // ignore invalid accelerators
+  }
+  return false;
+}
 
-  ipcMain.handle("app:get-state", () => publicState());
-  ipcMain.handle("session:ensure-fresh", () => ensureFreshSession());
-  ipcMain.handle("window:expand", () => expand());
-  ipcMain.handle("window:collapse", () => collapse());
-  ipcMain.handle("session:new", (_event, seed) => {
-    const session = newSession(seed || {});
-    return { state: publicState(), sessionId: session.id };
-  });
-  ipcMain.handle("session:select", (_event, sessionId) => {
-    if (!getSession(sessionId)) throw new Error("找不到该会话");
-    return publicState();
-  });
-  ipcMain.handle("message:send", sendMessage);
-  ipcMain.handle("paths:drop", (_event, payload) => {
-    const { folders, files } = classifyPaths(payload?.paths || []);
-    let session = payload?.sessionId ? getSession(payload.sessionId) : null;
-    if (folders.length && payload?.target === "icon") {
-      session = newSession({ workspacePath: folders[0], title: path.basename(folders[0]) || "工作空间会话" });
-    } else {
-      session = session || latestUsableSession();
-      if (folders.length) {
-        if (!session.workspacePath) session.workspacePath = folders[0];
-        session.pendingWorkspacePath = folders[0];
+if (!hasInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => expand());
+
+  app.whenReady().then(() => {
+    if (process.platform === "win32") app.setAppUserModelId("com.quickhermes.client");
+    if (isMac && app.dock) app.dock.hide(); // tray-resident floating app; no dock icon
+    loadState();
+    createBubbleWindow();
+    createPanelWindow();
+    createTray();
+    registerHotkey(state.settings.hotkey);
+
+    ipcMain.handle("app:get-state", () => publicState());
+    ipcMain.handle("session:ensure-fresh", () => ensureFreshSession());
+    ipcMain.handle("window:expand", () => expand());
+    ipcMain.handle("window:collapse", () => collapse());
+    ipcMain.handle("session:new", (_event, seed) => {
+      const session = newSession(seed || {});
+      return { state: publicState(), sessionId: session.id };
+    });
+    ipcMain.handle("session:select", (_event, sessionId) => {
+      if (!getSession(sessionId)) throw new Error("找不到该会话");
+      return publicState();
+    });
+    ipcMain.handle("session:delete", deleteSession);
+    ipcMain.handle("session:rename", renameSession);
+    ipcMain.handle("session:export", (event, sessionId) => exportSession(event, sessionId));
+    ipcMain.handle("message:send", sendMessage);
+    ipcMain.handle("run:cancel", cancelRun);
+    ipcMain.handle("connection:test", testConnection);
+    ipcMain.handle("clipboard:write-text", (_event, text) => {
+      clipboard.writeText(String(text == null ? "" : text));
+      return true;
+    });
+    ipcMain.handle("paths:drop", (_event, payload) => {
+      const { folders, files } = classifyPaths(payload?.paths || []);
+      let session = payload?.sessionId ? getSession(payload.sessionId) : null;
+      if (folders.length && payload?.target === "icon") {
+        session = newSession({ workspacePath: folders[0], title: path.basename(folders[0]) || "工作空间会话" });
+      } else {
+        session = session || latestUsableSession();
+        if (folders.length) {
+          if (!session.workspacePath) session.workspacePath = folders[0];
+          session.pendingWorkspacePath = folders[0];
+        }
+        session.pendingAttachments = [...(session.pendingAttachments || []), ...files];
+        session.updatedAt = nowIso();
+        saveState();
       }
-      session.pendingAttachments = [...(session.pendingAttachments || []), ...files];
-      session.updatedAt = nowIso();
-      saveState();
-    }
-    return { state: publicState(), sessionId: session.id, folders, files };
-  });
-  ipcMain.handle("clipboard:save-image", () => saveClipboardImage());
-  ipcMain.handle("settings:save", (_event, nextSettings) => {
-    const apiKey = nextSettings.apiKey === "********" ? state.settings.apiKey : String(nextSettings.apiKey || "");
-    state.settings = {
-      ...state.settings,
-      apiBaseUrl: String(nextSettings.apiBaseUrl || DEFAULT_SETTINGS.apiBaseUrl).replace(/\/$/, ""),
-      apiKey,
-      idleMinutes: Math.max(1, Number(nextSettings.idleMinutes || 30)),
-      launchAtLogin: Boolean(nextSettings.launchAtLogin),
-    };
-    app.setLoginItemSettings({ openAtLogin: state.settings.launchAtLogin, path: process.execPath });
-    saveState();
-    return publicState();
-  });
-  ipcMain.handle("settings:login-item", () => app.getLoginItemSettings());
+      return { state: publicState(), sessionId: session.id, folders, files };
+    });
+    ipcMain.handle("clipboard:save-image", () => saveClipboardImage());
+    ipcMain.handle("settings:save", (_event, nextSettings) => {
+      const userChangedKey = nextSettings.apiKey !== "********";
+      const apiKey = userChangedKey ? String(nextSettings.apiKey || "") : state.settings.apiKey;
+      if (userChangedKey) {
+        // User typed a fresh key; stop preserving the old un-decryptable cipher.
+        apiKeyDecryptFailed = false;
+        apiKeyCipherOnDisk = null;
+      }
+      const theme = ["system", "light", "dark"].includes(nextSettings.theme) ? nextSettings.theme : "system";
+      const hotkey = String(nextSettings.hotkey || DEFAULT_SETTINGS.hotkey);
+      state.settings = {
+        ...state.settings,
+        apiBaseUrl: String(nextSettings.apiBaseUrl || DEFAULT_SETTINGS.apiBaseUrl).replace(/\/$/, ""),
+        apiKey,
+        idleMinutes: Math.max(1, Number(nextSettings.idleMinutes || 30)),
+        launchAtLogin: Boolean(nextSettings.launchAtLogin),
+        theme,
+        hotkey,
+      };
+      app.setLoginItemSettings({ openAtLogin: state.settings.launchAtLogin, path: process.execPath });
+      const hotkeyOk = registerHotkey(hotkey);
+      flushState();
+      sendEvent("theme-changed", { theme });
+      sendEvent("hotkey-result", { ok: hotkeyOk, hotkey });
+      return publicState();
+    });
+    ipcMain.handle("settings:login-item", () => app.getLoginItemSettings());
 
-  app.on("activate", () => {
-    if (!bubbleWindow || bubbleWindow.isDestroyed()) {
-      createBubbleWindow();
-      createPanelWindow();
-    } else {
-      collapse();
-    }
+    app.on("activate", () => {
+      if (!bubbleWindow || bubbleWindow.isDestroyed()) {
+        createBubbleWindow();
+        createPanelWindow();
+      } else {
+        collapse();
+      }
+    });
   });
-});
 
-app.on("before-quit", () => {
-  isQuitting = true;
-});
+  app.on("before-quit", () => {
+    isQuitting = true;
+    globalShortcut.unregisterAll();
+    flushState();
+  });
 
-// Keep the app resident in the tray when all windows are hidden/closed.
-app.on("window-all-closed", (event) => {
-  if (!isQuitting) event.preventDefault();
-});
+  app.on("window-all-closed", (event) => {
+    if (!isQuitting) event.preventDefault();
+  });
+}

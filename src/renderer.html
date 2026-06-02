@@ -26,9 +26,25 @@
             <span>API Key</span>
             <input id="apiKey" type="password" spellcheck="false" placeholder="本机无密钥可留空" />
           </label>
+          <div class="test-conn-row">
+            <button id="testConnBtn" class="secondary-action">测试连接</button>
+            <span id="testConnResult" class="test-result"></span>
+          </div>
           <label>
             <span>新会话间隔（分钟）</span>
             <input id="idleMinutes" type="number" min="1" max="1440" />
+          </label>
+          <label>
+            <span>主题</span>
+            <div id="themeSeg" class="seg">
+              <button type="button" class="seg-btn" data-value="system">跟随系统</button>
+              <button type="button" class="seg-btn" data-value="light">浅色</button>
+              <button type="button" class="seg-btn" data-value="dark">深色</button>
+            </div>
+          </label>
+          <label>
+            <span>全局热键</span>
+            <input id="hotkeyInput" type="text" spellcheck="false" placeholder="例如 CommandOrControl+Shift+H" />
           </label>
           <label class="toggle-row">
             <span>开机自动启动</span>
@@ -57,11 +73,13 @@
               <span>最近会话</span>
               <button id="toggleAllBtn" class="link-button">展开全部</button>
             </div>
+            <input id="sessionSearch" class="session-search" type="text" placeholder="搜索会话…" spellcheck="false" />
             <div id="sessionList" class="session-list"></div>
           </section>
         </div>
       </section>
     </main>
+    <script src="./markdown.js"></script>
     <script src="./renderer.js"></script>
   </body>
 </html>
