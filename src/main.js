@@ -779,8 +779,6 @@ if (!hasInstanceLock) {
       sendEvent("hotkey-result", { ok: hotkeyOk, hotkey });
       return publicState();
     });
-    ipcMain.handle("settings:login-item", () => app.getLoginItemSettings());
-
     app.on("activate", () => {
       if (!bubbleWindow || bubbleWindow.isDestroyed()) {
         createBubbleWindow();
